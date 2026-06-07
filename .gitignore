@@ -12,8 +12,8 @@ htmlcov/
 .venv/
 .env
 
-# Project data / state
-data/
+# Project data / state (runtime output at repo root only — NOT src/data or docs/data)
+/data/
 *.db
 *.sqlite
 *.sqlite3
