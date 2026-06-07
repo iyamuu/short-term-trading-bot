@@ -6,8 +6,9 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Single open position (one-way mode). contracts is ALWAYS positive, even for SHORT;
--- direction is carried by `side`.
+-- Open position(s) in one-way mode. The "at most one open position" invariant is
+-- enforced in StateStore.open_trade() (not by the PK, which is per trade_id).
+-- contracts is ALWAYS positive, even for SHORT; direction is carried by `side`.
 CREATE TABLE IF NOT EXISTS open_position (
     trade_id        TEXT PRIMARY KEY,
     signal_id       TEXT,

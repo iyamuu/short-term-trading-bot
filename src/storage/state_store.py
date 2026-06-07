@@ -72,6 +72,16 @@ class StateStore:
         side_val = side.value if isinstance(side, Side) else side
         entry_time = entry_time or _utcnow()
         with self.conn:
+            # one-way mode: at most one open position at a time. Reject explicitly
+            # rather than silently storing a second concurrent position.
+            existing = self.conn.execute(
+                "SELECT trade_id FROM open_position LIMIT 1"
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(
+                    f"open position already exists (trade_id={existing['trade_id']}); "
+                    "one-way mode allows only one open position"
+                )
             self.conn.execute(
                 """INSERT INTO open_position
                    (trade_id, signal_id, side, entry_time, entry_price, contracts,

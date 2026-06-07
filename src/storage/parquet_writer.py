@@ -40,8 +40,15 @@ def append_rows(
     if not rows:
         return 0
 
+    # Dedup within this batch first (idempotency must hold for duplicates passed in a
+    # single call, not only against already-persisted rows). Keep first occurrence.
+    seen_batch: set[str] = set()
     by_date: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
+        rid = str(r[id_field])
+        if rid in seen_batch:
+            continue
+        seen_batch.add(rid)
         by_date.setdefault(_date_of(r[ts_field]), []).append(r)
 
     written = 0

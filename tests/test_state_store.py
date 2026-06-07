@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from src.storage.models import Side
 
 from conftest import make_trade
@@ -23,6 +24,20 @@ def test_open_attach_close_lifecycle(store):
     # summary parked in outbox
     pending = store.pending_outbox()
     assert any(p["kind"] == "TRADE" for p in pending)
+
+
+def test_second_open_position_rejected(store):
+    store.open_trade(trade_id="t1", side=Side.LONG, entry_price=100.0,
+                     contracts=0.01, initial_sl=99.0)
+    # one-way mode: opening a second concurrent position must be rejected
+    with pytest.raises(ValueError):
+        store.open_trade(trade_id="t2", side=Side.SHORT, entry_price=100.0,
+                         contracts=0.01, initial_sl=101.0)
+    # after closing the first, a new one is allowed
+    store.close_trade(make_trade(trade_id="t1"))
+    store.open_trade(trade_id="t2", side=Side.SHORT, entry_price=100.0,
+                     contracts=0.01, initial_sl=101.0)
+    assert store.get_open_position("t2") is not None
 
 
 def test_short_contracts_positive(store):

@@ -1,16 +1,19 @@
-"""Bitget order-parameter construction (Phase 0) — pure, no network.
+"""Order-argument construction for CCXT (Phase 0) — pure, no network.
 
-This module ONLY builds the parameter dicts that will later be handed to CCXT /
-Bitget REST. Keeping construction pure lets us pin Bitget's quirks in tests before any
-live wiring exists (Issue Phase 0: "fix one-way / hedged:False / reduceOnly / stop
-order spec in tests"):
+IMPORTANT framing (per review): these functions build **CCXT-unified** arguments for
+``exchange.create_order(symbol, type, side, amount, price, params)`` — NOT raw Bitget
+REST request bodies. The raw Bitget mapping (``marginCoin``, ``reduceOnly`` as YES/NO,
+``triggerPrice``/``executePrice``/``planType``/``holdSide`` for TPSL/trigger orders) is
+CCXT's responsibility; pinning the exact REST call is deferred to the execution phase
+and will be done against a **mocked CCXT client**, not asserted here.
 
-- one-way mode, ``hedged: False``
-- closing orders MUST be ``reduceOnly``
-- stop-loss = market order + ``stopPrice`` + ``triggerType: mark_price``
+What we *do* pin now is our own invariants, expressed in CCXT-unified terms:
+
+- one-way mode (position mode is set once via ``setPositionMode(hedged=False)``)
+- closing orders MUST carry ``reduceOnly: True`` (CCXT-unified boolean)
+- stop-loss = market trigger order via ``triggerPrice`` + ``triggerType: mark_price``
+  (``triggerType`` is a Bitget passthrough in ``params``)
 - every order carries a ``clientOid`` for idempotency
-
-Actual submission (CCXT client, retries, reconciliation) lands in later phases.
 """
 
 from __future__ import annotations
@@ -19,8 +22,9 @@ from typing import Any
 
 from ..storage.models import OrderRole, Side
 
-PRODUCT_TYPE = "USDT-FUTURES"
+# Bitget passthrough: trigger evaluated against the mark price (set in CCXT params).
 TRIGGER_TYPE_MARK = "mark_price"
+DEFAULT_MARGIN_MODE = "isolated"
 
 
 def _close_side(position_side: Side) -> str:
@@ -41,21 +45,18 @@ def build_entry_order(
     price: float | None = None,
 ) -> dict[str, Any]:
     """Entry order (market if ``price`` is None, else limit). Never reduceOnly."""
-    order_type = "limit" if price is not None else "market"
-    params: dict[str, Any] = {
+    return {
         "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "marginMode": "isolated",
+        "type": "limit" if price is not None else "market",
         "side": _open_side(side),
-        "orderType": order_type,
-        "size": size,
-        "reduceOnly": False,
-        "hedged": False,
-        "clientOid": client_oid,
+        "amount": size,
+        "price": price,
+        "params": {
+            "reduceOnly": False,
+            "marginMode": DEFAULT_MARGIN_MODE,
+            "clientOid": client_oid,
+        },
     }
-    if price is not None:
-        params["price"] = price
-    return params
 
 
 def build_reduce_order(
@@ -70,22 +71,19 @@ def build_reduce_order(
     """A TP (or any partial/full close) order. Always reduceOnly."""
     if role not in (OrderRole.TP1, OrderRole.TP2):
         raise ValueError(f"build_reduce_order is for TP roles, got {role}")
-    order_type = "limit" if price is not None else "market"
-    params: dict[str, Any] = {
+    return {
         "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "marginMode": "isolated",
+        "type": "limit" if price is not None else "market",
         "side": _close_side(position_side),
-        "orderType": order_type,
-        "size": size,
-        "reduceOnly": True,
-        "hedged": False,
-        "clientOid": client_oid,
-        "orderRole": role.value,
+        "amount": size,
+        "price": price,
+        "params": {
+            "reduceOnly": True,
+            "marginMode": DEFAULT_MARGIN_MODE,
+            "clientOid": client_oid,
+            "orderRole": role.value,
+        },
     }
-    if price is not None:
-        params["price"] = price
-    return params
 
 
 def build_stop_loss_order(
@@ -96,18 +94,19 @@ def build_stop_loss_order(
     stop_price: float,
     client_oid: str,
 ) -> dict[str, Any]:
-    """Stop-loss: market execution, triggered on mark price, reduceOnly."""
+    """Stop-loss: market trigger order on mark price, reduceOnly."""
     return {
         "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "marginMode": "isolated",
+        "type": "market",
         "side": _close_side(position_side),
-        "orderType": "market",
-        "size": size,
-        "reduceOnly": True,
-        "hedged": False,
-        "stopPrice": stop_price,
-        "triggerType": TRIGGER_TYPE_MARK,
-        "clientOid": client_oid,
-        "orderRole": OrderRole.SL.value,
+        "amount": size,
+        "price": None,
+        "params": {
+            "reduceOnly": True,
+            "marginMode": DEFAULT_MARGIN_MODE,
+            "triggerPrice": stop_price,
+            "triggerType": TRIGGER_TYPE_MARK,
+            "clientOid": client_oid,
+            "orderRole": OrderRole.SL.value,
+        },
     }

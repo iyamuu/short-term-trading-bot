@@ -39,8 +39,10 @@ no-trade 条件（`LOW_VOL_CHOP` / `HIGH_VOL_RISK` 等）は **エントリー�
 - TP1（`tp1_r`, 既定 1.0R） / TP2（`tp2_r`, 既定 2.0R）の部分利確。
 - TP1 約定後、残ポジションの SL を建値へ移動（`move_sl_to_breakeven_after_tp1`）。
 - 2R 到達後（`trailing_after_r`）に trailing stop。
-- すべての決済注文は reduceOnly。SL は market + stopPrice + triggerType=mark_price。
-  （発注パラメータは `src/execution/bitget_client.py` で固定、テスト済み）
+- すべての決済注文は reduceOnly。SL は market trigger（mark price 基準）。
+  発注引数は CCXT-unified 形（`triggerPrice` + `triggerType` passthrough）で
+  `src/execution/bitget_client.py` に固定・テスト済み。生の Bitget REST へのマッピングは
+  CCXT 側の責務として後続の execution フェーズで mock 固定する。
 
 ## サイズ計算
 

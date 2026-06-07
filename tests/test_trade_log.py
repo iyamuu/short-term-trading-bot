@@ -32,3 +32,11 @@ def test_trade_log_idempotent(base_dir):
     files = list(base_dir.glob("trade_log/dt=*/*.parquet"))
     df = pd.read_parquet(files[0])
     assert len(df) == 1
+
+
+def test_trade_log_dedups_within_batch(base_dir):
+    # same trade_id passed twice in ONE append call must not duplicate
+    written = trade_log.append(base_dir, [make_trade(), make_trade()])
+    assert written == 1
+    df = pd.read_parquet(next(base_dir.glob("trade_log/dt=*/*.parquet")))
+    assert len(df) == 1

@@ -44,7 +44,8 @@ def _f(value: Any) -> float:
 def _max_drawdown(pnl_sorted: pd.Series) -> float:
     if pnl_sorted.empty:
         return 0.0
-    equity = pnl_sorted.cumsum()
+    # Equity starts at 0 (the initial peak) so a losing first trade counts as drawdown.
+    equity = pd.concat([pd.Series([0.0]), pnl_sorted.reset_index(drop=True)]).cumsum()
     running_max = equity.cummax()
     drawdown = equity - running_max
     return float(drawdown.min())  # <= 0
