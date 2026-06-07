@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+.env
+
+# Project data / state
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+
+# OS
+.DS_Store
