@@ -7,8 +7,11 @@ writes. This is the data foundation the event backtester (PR #4) will read.
 Scope: public endpoints only — API keys are NOT required and NOT used. WebSocket,
 private API, order placement and candle building are out of scope (later phases).
 
-The ``exchange`` handle is injected into every function so tests can pass a synthetic
-fake instead of touching the network.
+Symbol handling: storage uses the **market symbol** (e.g. ``BTCUSDT``) in the parquet
+path / id / ``symbol`` column, while the exchange API is called with the **CCXT unified
+symbol** (e.g. ``BTC/USDT:USDT``). The unified form contains ``/`` and ``:`` and must
+never reach the filesystem path. The ``exchange`` handle is injected so tests can pass a
+synthetic fake instead of touching the network.
 """
 
 from __future__ import annotations
@@ -59,8 +62,15 @@ def to_ccxt_symbol(symbol: str, product_type: str = "USDT-FUTURES") -> str:
 def dataset_name(kind: str, symbol: str, timeframe: str | None = None) -> str:
     """Single source of truth for parquet dataset paths (Hive-style, sans ``dt=``).
 
+    ``symbol`` must be a filesystem-safe MARKET symbol (e.g. ``BTCUSDT``) — a CCXT
+    unified symbol (``BTC/USDT:USDT``) would inject path separators and is rejected.
     The ``dt=YYYY-MM-DD`` partition is appended by ``parquet_writer.append_rows``.
     """
+    if "/" in symbol or ":" in symbol:
+        raise ValueError(
+            f"symbol must be a market symbol (e.g. BTCUSDT), not a CCXT unified "
+            f"symbol with '/'/':': got {symbol!r}"
+        )
     if kind == "ohlcv":
         if timeframe is None:
             raise ValueError("timeframe required for ohlcv dataset")
@@ -84,6 +94,7 @@ def _interval_ms(timeframe: str) -> int:
 def normalize_ohlcv(
     raw: list[list[float]], symbol: str, timeframe: str
 ) -> list[dict[str, Any]]:
+    """``symbol`` is the market symbol stored in the row / id (not the CCXT symbol)."""
     rows: list[dict[str, Any]] = []
     for candle in raw:
         ts = int(candle[0])
@@ -104,28 +115,50 @@ def normalize_ohlcv(
     return rows
 
 
+def normalize_funding(raw: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in raw:
+        ts = int(item["timestamp"])
+        rate = item.get("fundingRate")
+        rows.append(
+            {
+                "funding_id": f"{symbol}:{ts}",
+                "timestamp": ts,
+                "time_iso": _iso(ts),
+                "symbol": symbol,
+                "funding_rate": None if rate is None else float(rate),
+            }
+        )
+    return rows
+
+
 # -------------------------------------------------------------------------- fetch
 def fetch_ohlcv_range(
     exchange: Exchange,
-    symbol: str,
+    ccxt_symbol: str,
     timeframe: str,
     since_ms: int,
     until_ms: int | None = None,
     page_limit: int = 1000,
+    *,
+    store_symbol: str | None = None,
 ) -> list[dict[str, Any]]:
     """Page through fetch_ohlcv from ``since_ms`` until exhausted or ``until_ms``.
 
-    CCXT returns candles at/after ``since`` up to ``limit`` — the final page can spill
-    past ``until_ms``, so anything with ``timestamp > until_ms`` is dropped here.
+    The exchange is called with ``ccxt_symbol``; rows are normalized under
+    ``store_symbol`` (the market symbol, default = ``ccxt_symbol``). CCXT returns candles
+    at/after ``since`` up to ``limit`` — the final page can spill past ``until_ms``, so
+    anything with ``timestamp > until_ms`` is dropped here.
     """
+    store_symbol = store_symbol or ccxt_symbol
     interval = _interval_ms(timeframe)
     out: list[dict[str, Any]] = []
     cursor = since_ms
     while True:
-        batch = exchange.fetch_ohlcv(symbol, timeframe, cursor, page_limit)
+        batch = exchange.fetch_ohlcv(ccxt_symbol, timeframe, cursor, page_limit)
         if not batch:
             break
-        rows = normalize_ohlcv(batch, symbol, timeframe)
+        rows = normalize_ohlcv(batch, store_symbol, timeframe)
         if until_ms is not None:
             rows = [r for r in rows if r["timestamp"] <= until_ms]
         out.extend(rows)
@@ -142,21 +175,42 @@ def fetch_ohlcv_range(
     return out
 
 
-def normalize_funding(raw: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for item in raw:
-        ts = int(item["timestamp"])
-        rate = item.get("fundingRate")
-        rows.append(
-            {
-                "funding_id": f"{symbol}:{ts}",
-                "timestamp": ts,
-                "time_iso": _iso(ts),
-                "symbol": symbol,
-                "funding_rate": None if rate is None else float(rate),
-            }
-        )
-    return rows
+def fetch_funding_range(
+    exchange: Any,
+    ccxt_symbol: str,
+    since_ms: int,
+    until_ms: int | None = None,
+    page_limit: int = 100,
+    *,
+    store_symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """Page through fetch_funding_rate_history. Funding has no fixed interval, so the
+    cursor advances to ``last_ts + 1`` between pages; duplicates are deduped on write."""
+    store_symbol = store_symbol or ccxt_symbol
+    fetch = getattr(exchange, "fetch_funding_rate_history", None)
+    if fetch is None:
+        raise NotImplementedError("exchange has no fetch_funding_rate_history")
+    out: list[dict[str, Any]] = []
+    cursor = since_ms
+    while True:
+        batch = fetch(ccxt_symbol, cursor, page_limit)
+        if not batch:
+            break
+        rows = normalize_funding(batch, store_symbol)
+        if until_ms is not None:
+            rows = [r for r in rows if r["timestamp"] <= until_ms]
+        out.extend(rows)
+
+        last_ts = int(batch[-1]["timestamp"])
+        if until_ms is not None and last_ts >= until_ms:
+            break
+        if len(batch) < page_limit:
+            break
+        next_cursor = last_ts + 1
+        if next_cursor <= cursor:  # no forward progress -> stop (defensive)
+            break
+        cursor = next_cursor
+    return out
 
 
 # --------------------------------------------------------------------- validation
@@ -241,6 +295,7 @@ class FundingBackfillResult:
     funding_supported: bool = True
     funding_error: str | None = None
     rows_written: int = 0
+    fetched: int = 0
 
 
 def backfill_ohlcv(
@@ -250,8 +305,11 @@ def backfill_ohlcv(
     timeframe: str,
     since_ms: int | None = None,
     until_ms: int | None = None,
+    ccxt_symbol: str | None = None,
 ) -> OhlcvBackfillResult:
-    """Incrementally backfill OHLCV into parquet. Resumes after the last stored ts."""
+    """Incrementally backfill OHLCV into parquet. ``symbol`` is the market symbol used
+    for storage; the exchange is called with ``ccxt_symbol`` (default = mapped)."""
+    ccxt_symbol = ccxt_symbol or to_ccxt_symbol(symbol)
     name = dataset_name("ohlcv", symbol, timeframe)
     result = OhlcvBackfillResult(dataset=name)
 
@@ -259,7 +317,9 @@ def backfill_ohlcv(
         last = last_stored_timestamp(base_dir, name)
         since_ms = (last + _interval_ms(timeframe)) if last is not None else 0
 
-    rows = fetch_ohlcv_range(exchange, symbol, timeframe, since_ms, until_ms)
+    rows = fetch_ohlcv_range(
+        exchange, ccxt_symbol, timeframe, since_ms, until_ms, store_symbol=symbol
+    )
     result.fetched = len(rows)
     if not rows:
         return result
@@ -279,18 +339,24 @@ def backfill_funding(
     exchange: Any,
     symbol: str,
     since_ms: int | None = None,
+    until_ms: int | None = None,
     page_limit: int = 100,
+    ccxt_symbol: str | None = None,
 ) -> FundingBackfillResult:
-    """Backfill funding-rate history. Never breaks the OHLCV path: on any error the
-    result carries ``funding_supported=False`` + ``funding_error`` instead of raising."""
+    """Incrementally backfill funding-rate history (paginated). Best-effort: on any
+    error the result carries ``funding_supported=False`` + ``funding_error`` instead of
+    raising, so the OHLCV path is never blocked by funding."""
     name = dataset_name("funding", symbol)
     result = FundingBackfillResult(dataset=name)
     try:
-        fetch = getattr(exchange, "fetch_funding_rate_history", None)
-        if fetch is None:
-            raise NotImplementedError("exchange has no fetch_funding_rate_history")
-        raw = fetch(symbol, since_ms, page_limit)
-        rows = normalize_funding(raw, symbol)
+        ccxt_symbol = ccxt_symbol or to_ccxt_symbol(symbol)
+        if since_ms is None:
+            last = last_stored_timestamp(base_dir, name)
+            since_ms = (last + 1) if last is not None else 0
+        rows = fetch_funding_range(
+            exchange, ccxt_symbol, since_ms, until_ms, page_limit, store_symbol=symbol
+        )
+        result.fetched = len(rows)
         result.rows_written = append_rows(
             base_dir, name, rows, id_field="funding_id", ts_field="time_iso"
         )
@@ -310,7 +376,7 @@ def build_exchange() -> Any:
 
 def _main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Bitget public OHLCV/funding backfill (no API key)")
-    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--symbol", default="BTCUSDT", help="market symbol, e.g. BTCUSDT")
     ap.add_argument("--product-type", default="USDT-FUTURES")
     ap.add_argument("--timeframe", default="1m", choices=sorted(TIMEFRAME_MS))
     ap.add_argument("--days", type=int, default=1, help="lookback window when --since omitted")
@@ -328,7 +394,10 @@ def _main(argv: list[str] | None = None) -> None:
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         since = now_ms - args.days * 86_400_000
 
-    res = backfill_ohlcv(args.base_dir, exchange, ccxt_symbol, args.timeframe, since, args.until)
+    res = backfill_ohlcv(
+        args.base_dir, exchange, args.symbol, args.timeframe, since, args.until,
+        ccxt_symbol=ccxt_symbol,
+    )
     print(f"[ohlcv] dataset={res.dataset}")
     print(f"[ohlcv] fetched={res.fetched} written={res.rows_written} "
           f"range=[{res.from_ts}..{res.to_ts}] gaps={len(res.gaps)}")
@@ -336,9 +405,9 @@ def _main(argv: list[str] | None = None) -> None:
         print(f"  gap: {_iso(g[0])} .. {_iso(g[1])} (missing {g[2]})")
 
     if args.with_funding:
-        fr = backfill_funding(args.base_dir, exchange, ccxt_symbol)
-        print(f"[funding] supported={fr.funding_supported} written={fr.rows_written} "
-              f"error={fr.funding_error}")
+        fr = backfill_funding(args.base_dir, exchange, args.symbol, ccxt_symbol=ccxt_symbol)
+        print(f"[funding] supported={fr.funding_supported} fetched={fr.fetched} "
+              f"written={fr.rows_written} error={fr.funding_error}")
 
 
 if __name__ == "__main__":

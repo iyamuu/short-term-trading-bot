@@ -9,7 +9,7 @@ import pytest
 from src.data import rest_backfill as rb
 
 INTERVAL = rb.TIMEFRAME_MS["1m"]
-SYMBOL = "BTC/USDT:USDT"
+SYMBOL = "BTCUSDT"  # market symbol used for storage (NOT the CCXT unified form)
 
 
 def make_candles(start_ms: int, n: int, interval: int = INTERVAL) -> list[list[float]]:
@@ -41,9 +41,16 @@ def test_to_ccxt_symbol():
 
 
 def test_dataset_name_single_source():
-    assert rb.dataset_name("ohlcv", "BTC/USDT:USDT", "1m") == \
-        "market/ohlcv/symbol=BTC/USDT:USDT/timeframe=1m"
-    assert rb.dataset_name("funding", "BTC/USDT:USDT") == "market/funding/symbol=BTC/USDT:USDT"
+    assert rb.dataset_name("ohlcv", "BTCUSDT", "1m") == "market/ohlcv/symbol=BTCUSDT/timeframe=1m"
+    assert rb.dataset_name("funding", "BTCUSDT") == "market/funding/symbol=BTCUSDT"
+
+
+def test_dataset_name_rejects_ccxt_symbol():
+    # CCXT unified symbols contain '/' and ':' which would break the path layout
+    with pytest.raises(ValueError):
+        rb.dataset_name("ohlcv", "BTC/USDT:USDT", "1m")
+    with pytest.raises(ValueError):
+        rb.dataset_name("funding", "BTC/USDT:USDT")
 
 
 def test_composite_id_distinguishes_symbol_timeframe():
@@ -102,11 +109,15 @@ def test_parquet_layout_and_schema(base_dir):
     res = rb.backfill_ohlcv(base_dir, ex, SYMBOL, "1m", since_ms=0)
     assert res.rows_written == 10
 
+    # the symbol token is a single literal dir, NOT split by '/'
+    assert (base_dir / "market" / "ohlcv" / "symbol=BTCUSDT" / "timeframe=1m").is_dir()
+
     name = rb.dataset_name("ohlcv", SYMBOL, "1m")
     files = list((base_dir / name).glob("dt=*/data.parquet"))
     assert files
     df = pd.read_parquet(files[0])
     assert set(rb.OHLCV_COLUMNS).issubset(df.columns)
+    assert set(df["symbol"]) == {"BTCUSDT"}
 
 
 def test_idempotent_rewrite(base_dir):
@@ -147,21 +158,47 @@ def test_last_stored_timestamp_uses_latest_partition(base_dir):
 
 
 # -------------------------------------------------------------------------- funding
+FUNDING_INTERVAL = 28_800_000  # 8h
+
+
 class FundingExchange:
-    def fetch_funding_rate_history(self, symbol, since, limit):
-        return [
-            {"timestamp": 0, "fundingRate": 0.0001},
-            {"timestamp": 28_800_000, "fundingRate": -0.0002},
+    """since/limit-aware funding fake (ascending), for pagination/incremental tests."""
+
+    def __init__(self, n: int):
+        self.points = [
+            {"timestamp": i * FUNDING_INTERVAL, "fundingRate": 0.0001 * (1 if i % 2 else -1)}
+            for i in range(n)
         ]
+        self.calls: list[tuple[int | None, int | None]] = []
+
+    def fetch_funding_rate_history(self, symbol, since, limit):
+        self.calls.append((since, limit))
+        since = since or 0
+        sel = [p for p in self.points if p["timestamp"] >= since]
+        return sel[: (limit or len(sel))]
 
 
 def test_funding_happy_path(base_dir):
-    res = rb.backfill_funding(base_dir, FundingExchange(), SYMBOL)
+    res = rb.backfill_funding(base_dir, FundingExchange(2), SYMBOL)
     assert res.funding_supported is True
     assert res.rows_written == 2
     name = rb.dataset_name("funding", SYMBOL)
     df = pd.read_parquet(next((base_dir / name).glob("dt=*/data.parquet")))
     assert set(rb.FUNDING_COLUMNS).issubset(df.columns)
+    assert set(df["symbol"]) == {"BTCUSDT"}
+
+
+def test_funding_paginates_and_resumes(base_dir):
+    ex = FundingExchange(5)
+    # small page_limit forces multiple pages
+    res = rb.backfill_funding(base_dir, ex, SYMBOL, page_limit=2)
+    assert res.funding_supported is True
+    assert res.rows_written == 5
+    assert len(ex.calls) >= 3  # paged
+
+    # incremental: second run resumes after last stored ts -> nothing new
+    res2 = rb.backfill_funding(base_dir, ex, SYMBOL, page_limit=2)
+    assert res2.rows_written == 0
 
 
 def test_funding_unsupported_does_not_break_ohlcv(base_dir):

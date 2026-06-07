@@ -4,6 +4,10 @@
 parquet 化する。**APIキーは不要・未使用**、発注・private API は一切しない。backtest（PR #4）と
 将来の特徴量/ML の共通土台。状態ログ側は [current_state_schema.md](./current_state_schema.md) 参照。
 
+**シンボルの扱い**: ストレージ（parquet path / `symbol` 列 / id）は **市場シンボル `BTCUSDT`** を使い、
+取引所 API 呼び出しのみ **CCXT unified `BTC/USDT:USDT`** に変換して用いる（`to_ccxt_symbol`）。
+`/`・`:` を含む unified シンボルは path を壊すため `dataset_name` がガードして弾く。
+
 ## parquet レイアウト
 
 path は `dataset_name()` が単一生成（規約変更を1箇所に集約）。`dt=` パーティションは
@@ -48,6 +52,8 @@ funding:
 - **gap detection**: `detect_gaps` は timeframe 間隔から欠損区間 `(start_ms, end_ms, missing_count)` を
   **報告のみ**（fail させない）。backfill 結果に同梱。
 - **validation**: `validate_ohlcv_rows` がスキーマ・timestamp 単調増加・OHLC sanity・volume>=0 を検査。
+- **funding も pagination + incremental**: OHLCV 同様に `since` 省略時は最新 ts から resume し、
+  ページングで全件取得（cursor は `last_ts + 1`。funding は固定間隔でないため）。
 - **funding は best-effort**: 取得不可/未対応でも OHLCV は止めず、結果に
   `funding_supported: bool` / `funding_error: str|None` を返す。
 
