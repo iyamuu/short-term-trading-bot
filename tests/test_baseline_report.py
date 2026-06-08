@@ -14,11 +14,12 @@ from src.storage.models import ExitReason, Regime, Side  # noqa: E402
 
 def test_max_drawdown_counts_losing_first_trade():
     import pandas as pd
+    from src.analytics.metrics import max_drawdown
 
     # equity starts at 0: a -1 first trade is a -1 drawdown, recovered to -0.5
-    assert baseline_report._max_drawdown(pd.Series([-1.0, 0.5])) == -1.0
-    assert baseline_report._max_drawdown(pd.Series([2.0, -1.0])) == -1.0
-    assert baseline_report._max_drawdown(pd.Series([1.0, 1.0])) == 0.0
+    assert max_drawdown(pd.Series([-1.0, 0.5])) == -1.0
+    assert max_drawdown(pd.Series([2.0, -1.0])) == -1.0
+    assert max_drawdown(pd.Series([1.0, 1.0])) == 0.0
 
 
 def test_empty_is_safe(base_dir):

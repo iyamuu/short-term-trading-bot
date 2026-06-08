@@ -278,6 +278,35 @@ def last_stored_timestamp(base_dir: str | Path, name: str) -> int | None:
     return int(df["timestamp"].max())
 
 
+def load_ohlcv(
+    base_dir: str | Path,
+    symbol: str,
+    timeframe: str,
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read stored OHLCV back as ascending candle dicts (reader companion to backfill).
+
+    Validates that every row's ``symbol`` matches ``symbol`` (guards against a wrong
+    dataset path / mixed write). Returns ``[]`` when nothing is stored.
+    """
+    name = dataset_name("ohlcv", symbol, timeframe)
+    files = sorted(Path(base_dir).glob(f"{name}/dt=*/*.parquet"))
+    if not files:
+        return []
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    if "symbol" in df.columns:
+        bad = set(df["symbol"].unique()) - {symbol}
+        if bad:
+            raise ValueError(f"load_ohlcv: unexpected symbol(s) {bad} in {name}")
+    df = df.sort_values("timestamp")
+    if since_ms is not None:
+        df = df[df["timestamp"] >= since_ms]
+    if until_ms is not None:
+        df = df[df["timestamp"] <= until_ms]
+    return df.to_dict("records")
+
+
 # ------------------------------------------------------------------------ backfill
 @dataclass
 class OhlcvBackfillResult:
