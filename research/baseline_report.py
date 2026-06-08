@@ -23,6 +23,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.analytics.metrics import trade_metrics  # noqa: E402
+
 
 def _load(base_dir: str | Path, name: str) -> pd.DataFrame:
     glob = Path(base_dir) / name / "dt=*" / "*.parquet"
@@ -34,74 +36,14 @@ def _load(base_dir: str | Path, name: str) -> pd.DataFrame:
     ).df()
 
 
-def _f(value: Any) -> float:
-    """NA/None-safe float (empty or all-NA aggregates -> 0.0)."""
-    if value is None or pd.isna(value):
-        return 0.0
-    return float(value)
-
-
-def _max_drawdown(pnl_sorted: pd.Series) -> float:
-    if pnl_sorted.empty:
-        return 0.0
-    # Equity starts at 0 (the initial peak) so a losing first trade counts as drawdown.
-    equity = pd.concat([pd.Series([0.0]), pnl_sorted.reset_index(drop=True)]).cumsum()
-    running_max = equity.cummax()
-    drawdown = equity - running_max
-    return float(drawdown.min())  # <= 0
-
-
-def _breakdown(trades: pd.DataFrame, key: str) -> list[dict[str, Any]]:
-    if trades.empty or key not in trades:
-        return []
-    out = []
-    for val, grp in trades.groupby(key, dropna=False):
-        pnl = grp["pnl_abs"]
-        out.append(
-            {
-                key: None if pd.isna(val) else val,
-                "trade_count": int(len(grp)),
-                "win_rate": _f((pnl > 0).mean()) if len(grp) else 0.0,
-                "net_pnl": _f(pnl.sum()),
-                "avg_r": _f(grp["pnl_r"].mean()) if "pnl_r" in grp else 0.0,
-            }
-        )
-    return out
-
-
 def compute_baseline(base_dir: str | Path) -> dict[str, Any]:
     trades = _load(base_dir, "trade_log")
     candidates = _load(base_dir, "candidate_log")
 
     report: dict[str, Any] = {"trades": {}, "candidates": {}}
 
-    # ---- trade-side
-    t: dict[str, Any] = {"trade_count": int(len(trades))}
-    if not trades.empty:
-        pnl = trades["pnl_abs"]
-        wins = pnl[pnl > 0]
-        losses = pnl[pnl < 0]
-        t["win_rate"] = _f((pnl > 0).mean())
-        t["avg_win"] = _f(wins.mean()) if len(wins) else 0.0
-        t["avg_loss"] = _f(losses.mean()) if len(losses) else 0.0
-        gross_loss = abs(_f(losses.sum()))
-        t["profit_factor"] = _f(wins.sum()) / gross_loss if gross_loss else float("inf")
-        t["net_pnl"] = _f(pnl.sum())
-        t["average_r"] = _f(trades["pnl_r"].mean()) if "pnl_r" in trades else 0.0
-        t["median_r"] = _f(trades["pnl_r"].median()) if "pnl_r" in trades else 0.0
-        if "exit_time" in trades:
-            ordered = trades.sort_values("exit_time")["pnl_abs"]
-            t["max_drawdown"] = _max_drawdown(ordered)
-        t["avg_mfe_r"] = _f(trades["mfe_r"].mean()) if "mfe_r" in trades else 0.0
-        t["avg_mae_r"] = _f(trades["mae_r"].mean()) if "mae_r" in trades else 0.0
-        if "entry_time" in trades:
-            hours = pd.to_datetime(trades["entry_time"], utc=True, errors="coerce").dt.hour
-            trades = trades.assign(_hour=hours)
-        t["by_regime"] = _breakdown(trades, "regime")
-        t["by_setup"] = _breakdown(trades, "setup_name")
-        t["by_hour"] = _breakdown(trades, "_hour")
-        t["by_side"] = _breakdown(trades, "side")
-    report["trades"] = t
+    # ---- trade-side (shared metric computation)
+    report["trades"] = trade_metrics(trades)
 
     # ---- candidate-side
     c: dict[str, Any] = {"candidate_count": int(len(candidates))}
